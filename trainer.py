@@ -1,36 +1,33 @@
-# prerequisites
-import torch
-from torchvision import datasets, transforms
-from torchvision.utils import save_image
 import pytorch_lightning as pl
 
 from model import VAE
+from dataset import get_mnist_dataset
 
-bs = 100
-# MNIST Dataset
-train_dataset = datasets.MNIST(root='./mnist_data/', train=True, transform=transforms.ToTensor(), download=True)
-test_dataset = datasets.MNIST(root='./mnist_data/', train=False, transform=transforms.ToTensor(), download=False)
-
-# Data Loader (Input Pipeline)
-train_loader = torch.utils.data.DataLoader(dataset=train_dataset, batch_size=bs, shuffle=True)
-test_loader = torch.utils.data.DataLoader(dataset=test_dataset, batch_size=bs, shuffle=False)
-
-
-# build model
-vae = VAE(x_dim=784, h_dim1= 512, h_dim2=256, z_dim=2)
+z_dim = 49 * 4
 
 if __name__ == "__main__":
+    batch_size = 64
+    train_loader, test_loader = get_mnist_dataset()
+    # vae = VAE.load_from_checkpoint(
+    #     './lightning_logs/version_47/checkpoints/epoch=9-step=9380.ckpt')
+    vae = VAE(x_dim=784, h_dim1=196, z_dim=z_dim)
     trainer = pl.Trainer(
         max_epochs=20,
     )
     trainer.fit(
         model=vae,
         train_dataloaders=train_loader,
+        val_dataloaders=test_loader
     )
-    with torch.no_grad():
-        z = torch.randn(64, 2)
-        sample = vae.decoder(z)
-        
-        save_image(
-            sample.view(64, 1, 28, 28),
-            './samples/sample_' + '.png')
+    # with torch.no_grad():
+    #     batch_size = 25
+    #     sample = next(iter(train_loader))[:1]
+    #     print('actual_digit:', sample[1])
+    #     test_batch = sample[0][0].expand(batch_size, 1, 28, 28), \
+    #         torch.randint(0, 9, [batch_size, ])
+    #     print(test_batch[1])
+    #     reconstr, pred_prob, mu, log_var = vae(*test_batch)
+    #     
+    #     save_image(
+    #         reconstr.view(25, 1, 28, 28),
+    #         './samples/sample_' + '.png')
