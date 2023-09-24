@@ -140,7 +140,7 @@ class VAE(pl.LightningModule):
             recon_x.view(-1, 784), x.view(-1, 784), reduction='sum')
         KLD = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
         pred_loss = F.nll_loss(pred_prob, y)
-        return {"BCE": BCE / 100,
+        return {"BCE": BCE / 500,
                 "KLD": KLD / 100,
                 "clf": pred_loss }
 
@@ -158,11 +158,14 @@ class VAE(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         if batch_idx == 1:
             with torch.no_grad():
-                batch_size = 25
-                sample, y = batch[0][:1], batch[1][:1]
+                batch_size = 32
+                idx = random.randint(0, batch[0].shape[0] - 1)
+                sample, y = batch[0][idx: idx + 1], batch[1][idx: idx + 1]
                 print('actual_digit:', y)
+                random_y = torch.randint(0, 9, [batch_size, ]).to(self.device)
+                print('random_y:', random_y)
                 test_batch = sample[0].expand(batch_size, 1, 28, 28).to(self.device), \
-                    torch.randint(0, 9, [batch_size, ]).to(self.device)
+                    random_y
                 reconstr, pred_prob, mu, log_var = self(*test_batch)
                 
                 save_image(
