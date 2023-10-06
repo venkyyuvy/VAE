@@ -2,8 +2,9 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torchvision.utils import save_image
 import pytorch_lightning as pl
+
+from plot_utils import plot_resconstr
 
 def get_layer(layer_type, in_channel, out_channel,
               dropout_value=0.10):
@@ -30,12 +31,13 @@ def get_layer(layer_type, in_channel, out_channel,
         raise ValueError("wrong `layer_type`")
 
 def build_encoder(
+        in_channel=1,
         schema=list('CCPcCCPc'),
         channels=[8, 8, 8, 4, 8, 8, 8, 4,], 
         dropout_value=0.10):
     layers = []
     for layer_type, channel_in, channel_out in zip(
-        schema, [1, *channels], channels):
+        schema, [in_channel, *channels], channels):
         layers.append(
             get_layer(
                 layer_type,
@@ -46,16 +48,19 @@ def build_encoder(
     return nn.Sequential(*layers)
 
 def build_decoder(
+        in_channel=4,
+        out_channel=1,
         schema=list('CCUcCCUc'),
-        channels=[8, 8, 8, 4, 8, 8, 8, 1], 
+        channels=[8, 8, 8, 4, 8, 8, 8], 
         dropout_value=0.10):
     """
     input channels be 4
     output channels be 1
     """
     layers = []
+    channels = [*channels, out_channel]
     for layer_type, channel_in, channel_out in zip(
-        schema, [4, *channels], channels):
+        schema, [in_channel, *channels], channels):
         layers.append(
             get_layer(
                 layer_type,
@@ -66,13 +71,14 @@ def build_decoder(
     return nn.Sequential(*layers)
 
 def build_classifier(
+        in_channel=1,
         schema=list('CCCPcCCCPcCCCPcCCcGc'),
         channels=[8, 8, 16, 16, 4, 16, 8, 16, 16, 4, 16, 8, 16, 16,
                  4, 16, 8, 8, 8, 10], 
         dropout_value=0.10):
     layers = []
     for layer_type, channel_in, channel_out in zip(
-        schema, [1, *channels], channels):
+        schema, [in_channel, *channels], channels):
         layers.append(
             get_layer(
                 layer_type,
@@ -85,27 +91,65 @@ def build_classifier(
 
 class VAE(pl.LightningModule):
     def __init__(
-            self,
-            x_dim, h_dim1, z_dim, 
-            n_classes=10,
-            label_emb = 20
+        self,
+        x_dim, 
+        class_names,
+        x_channel: int=1,
+        z_step_down: int=4, 
+        z_n_channel: int=4,
+        n_classes: int=10,
+        label_emb: int=20,
+        kld_lambda: float=100,
+        reconst_lambda: float=500,
+        clf_lambda: float=1,
+        p_using_true_label: float=0.1
         ):
+        """
+        Encoder: 
+        reduces x_dim to h_dim1
+        projects to mu and sigma (x_dim / z_stepdown each)
+
+        label encoding with label_emb
+
+        Decoder:
+        concat sample~N(mu, sigma) and label_emb
+        projects to z_dim (z_n_channel * z_step_down ** 2)
+        expands back to x_dim
+        """
         super(VAE, self).__init__()
         self.save_hyperparameters()
         self.x_dim = x_dim
+        self.class_names = class_names
+        self.kld_lambda = kld_lambda
+        self.reconst_lambda = reconst_lambda
+        self.clf_lambda = clf_lambda
+        self.p_using_true_label = p_using_true_label
+        self.x_channel = x_channel
+        self.z_channel_size = x_dim // z_step_down
+        self.z_n_channel = z_n_channel
+        self.n_classes = n_classes
+        self.z_dim = z_n_channel * self.z_channel_size ** 2
         # encoder part
-        self.encoder_ = build_encoder()
-        self.fc1 = nn.Linear(h_dim1, z_dim)
-        self.fc2 = nn.Linear(h_dim1, z_dim)
+        self.encoder_ = build_encoder(
+            in_channel=self.x_channel
+        )
+        self.fc1 = nn.Linear(self.z_dim, self.z_dim)
+        self.fc2 = nn.Linear(self.z_dim, self.z_dim)
         # decoder part
-        self.decoder_ = build_decoder()
-        self.classifier = build_classifier()
+        self.decoder_ = build_decoder(
+            in_channel=self.z_n_channel,
+            out_channel=self.x_channel
+        )
+        self.classifier = build_classifier(
+            in_channel=3
+        )
         self.label_encoder = nn.Embedding(
             n_classes, label_emb)
-        self.label_mixer = nn.Linear(z_dim + label_emb, z_dim)
+        self.label_mixer = nn.Linear(
+            self.z_dim + label_emb, self.z_dim)
         
     def encoder(self, x):
-        h = self.encoder_(x).view(-1, 4 * 49)
+        h = self.encoder_(x).view(-1, self.z_dim)
         return self.fc1(h), self.fc2(h) # mu, log_var
     
     def sampling(self, mu, log_var):
@@ -114,10 +158,17 @@ class VAE(pl.LightningModule):
         return eps.mul(std).add_(mu) # return z sample
         
     def decoder(self, z, label):
-        z = torch.concat((z, self.label_encoder(label)),
-                         dim=1)
+        z = torch.concat(
+            (z, self.label_encoder(label)),
+            dim=1
+        )
         z = self.label_mixer(z)
-        z = z.view(-1, 4, 7, 7)
+        z = z.view(
+            -1, 
+            self.z_n_channel,
+            self.z_channel_size, 
+            self.z_channel_size
+        )
         reconst = self.decoder_(z)
         return F.sigmoid(reconst) 
     
@@ -131,48 +182,44 @@ class VAE(pl.LightningModule):
         reconstr = self.decoder(z, label)
         pred_prob = F.log_softmax(
             self.classifier(reconstr),
-            dim=1).view(-1, 10)
+            dim=1).view(-1, self.n_classes)
         return  reconstr, pred_prob, mu, log_var
 
-    @staticmethod
-    def loss_function(recon_x, x, y, mu, log_var, pred_prob):
-        BCE = F.binary_cross_entropy(
-            recon_x.view(-1, 784), x.view(-1, 784), reduction='sum')
+    def loss_function(self, recon_x, x, y, mu, log_var, pred_prob):
+        if self.x_channel == 1:
+            RECONST = F.binary_cross_entropy(
+                recon_x, x, reduction='sum')
+        else:
+            RECONST = F.mse_loss(recon_x, x)
+
         KLD = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
         pred_loss = F.nll_loss(pred_prob, y)
-        return {"BCE": BCE / 500,
-                "KLD": KLD / 100,
-                "clf": pred_loss }
+        return {"RECONST": RECONST / self.reconst_lambda,
+                "KLD": KLD / self.kld_lambda,
+                "clf": pred_loss / self.clf_lambda }
 
     def training_step(self, batch):
         x, y = batch
-        if random.random() < 0.1:
-            y = torch.randint(0, 9, y.shape).to(torch.long).to(self.device)
+        if random.random() > self.p_using_true_label:
+            y = self.get_random_labels(y.shape)
         recon_batch, pred_prob, mu, log_var = self(x, y)
         loss = self.loss_function(
-            recon_batch, x, y, mu, log_var, pred_prob)
+            recon_batch.view(-1, self.x_dim ** 2),
+            x.view(-1, self.x_dim ** 2),
+            y, mu, log_var, pred_prob)
         self.log_dict(loss, prog_bar=True)
         return sum(list(loss.values()))
 
-    
+    def get_random_labels(self, batch_size):
+        return torch.randint(
+            0, self.n_classes - 1, batch_size,
+        ).to(torch.long).to(self.device)
+
     def validation_step(self, batch, batch_idx):
         if batch_idx == 1:
-            with torch.no_grad():
-                batch_size = 32
-                idx = random.randint(0, batch[0].shape[0] - 1)
-                sample, y = batch[0][idx: idx + 1], batch[1][idx: idx + 1]
-                print('actual_digit:', y)
-                random_y = torch.randint(0, 9, [batch_size, ]).to(self.device)
-                print('random_y:', random_y)
-                test_batch = sample[0].expand(batch_size, 1, 28, 28).to(self.device), \
-                    random_y
-                reconstr, pred_prob, mu, log_var = self(*test_batch)
-                
-                save_image(
-                    reconstr.view(batch_size, 1, 28, 28),
-                    f'./samples/sample_{self.current_epoch}' + '.png')
+            plot_resconstr(self, batch)
         x, y = batch
-        y = torch.randint(0, 9, y.shape).to(torch.long).to(self.device)
+        y = self.get_random_labels(y.shape)
         recon_batch, pred_prob, mu, log_var = self(x, y)
         loss = self.loss_function(
             recon_batch, x, y, mu, log_var, pred_prob)
