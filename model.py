@@ -1,8 +1,13 @@
+"""
+right and wrong labels in the same batch
+
+"""
 import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import pytorch_lightning as pl
+from classifier_model import ResNet18
 
 from plot_utils import plot_resconstr
 
@@ -27,17 +32,22 @@ def get_layer(layer_type, in_channel, out_channel,
         return nn.AdaptiveAvgPool2d(output_size=1)
     elif layer_type == "U":
         return nn.Upsample(scale_factor=2, mode='nearest')
+        # return nn.ConvTranspose2d(in_channel, out_channel, 
+        #                           4, stride=2,
+        #                           padding=1)
     else:
         raise ValueError("wrong `layer_type`")
 
 def build_encoder(
-        in_channel=1,
         schema=list('CCPcCCPc'),
-        channels=[8, 8, 8, 4, 8, 8, 8, 4,], 
+        channels=[1, 8, 8, 8, 4, 8, 8, 8, 4], 
         dropout_value=0.10):
+    """
+    len(schema) == len(channels) + 1 
+    """
     layers = []
     for layer_type, channel_in, channel_out in zip(
-        schema, [in_channel, *channels], channels):
+        schema, channels, channels[1:]):
         layers.append(
             get_layer(
                 layer_type,
@@ -48,27 +58,24 @@ def build_encoder(
     return nn.Sequential(*layers)
 
 def build_decoder(
-        in_channel=4,
-        out_channel=1,
-        schema=list('CCUcCCUc'),
-        channels=[8, 8, 8, 4, 8, 8, 8], 
+        schema=list('CUcCCUc'),
+        channels=[8, 8, 8, 4, 8, 8, 8, 1], 
         dropout_value=0.10):
     """
     input channels be 4
     output channels be 1
     """
-    layers = []
-    channels = [*channels, out_channel]
-    for layer_type, channel_in, channel_out in zip(
-        schema, [in_channel, *channels], channels):
-        layers.append(
+    return nn.Sequential(
+        *[ 
             get_layer(
                 layer_type,
                 channel_in,
                 channel_out,
                 dropout_value)
-        )
-    return nn.Sequential(*layers)
+            for layer_type, channel_in, channel_out in zip(
+                schema, channels, channels[1:])
+        ]
+    )
 
 def build_classifier(
         in_channel=1,
@@ -92,6 +99,7 @@ def build_classifier(
 class VAE(pl.LightningModule):
     def __init__(
         self,
+        dataset,
         x_dim, 
         class_names,
         x_channel: int=1,
@@ -99,9 +107,9 @@ class VAE(pl.LightningModule):
         z_n_channel: int=4,
         n_classes: int=10,
         label_emb: int=20,
-        kld_lambda: float=100,
-        reconst_lambda: float=500,
-        clf_lambda: float=1,
+        kld_lambda: float=1e-2,
+        reconst_lambda: float=2e-3,
+        clf_lambda: float=1e-4,
         p_using_true_label: float=0.1
         ):
         """
@@ -118,6 +126,7 @@ class VAE(pl.LightningModule):
         """
         super(VAE, self).__init__()
         self.save_hyperparameters()
+        self.dataset = dataset
         self.x_dim = x_dim
         self.class_names = class_names
         self.kld_lambda = kld_lambda
@@ -131,18 +140,34 @@ class VAE(pl.LightningModule):
         self.z_dim = z_n_channel * self.z_channel_size ** 2
         # encoder part
         self.encoder_ = build_encoder(
-            in_channel=self.x_channel
+            schema=list('CCCPcCCCPcCCc'),
+            channels=[3, 32, 128, 128, 128, 32,
+                      32, 128, 256, 256, 
+                      32, 256, 256,
+                      4], 
         )
         self.fc1 = nn.Linear(self.z_dim, self.z_dim)
         self.fc2 = nn.Linear(self.z_dim, self.z_dim)
         # decoder part
         self.decoder_ = build_decoder(
-            in_channel=self.z_n_channel,
-            out_channel=self.x_channel
+            schema=list('CCCUcCCCUcCCc'),
+            channels=[4, 64, 128, 128, 128, 32, 
+                      128, 256, 256, 256, 
+                      32, 256, 256,
+                      3], 
         )
-        self.classifier = build_classifier(
-            in_channel=3
-        )
+        if self.dataset == "cifar":
+            self.classifier = ResNet18()
+            # load the pretrained model
+            self.classifier.load_state_dict(
+                torch.load("./resnet18.pth")
+            )
+            for param in self.classifier.parameters():
+                param.requires_grad = False
+        else:
+            self.classifier = build_classifier(
+                in_channel=3
+            )
         self.label_encoder = nn.Embedding(
             n_classes, label_emb)
         self.label_mixer = nn.Linear(
@@ -194,14 +219,20 @@ class VAE(pl.LightningModule):
 
         KLD = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
         pred_loss = F.nll_loss(pred_prob, y)
-        return {"RECONST": RECONST / self.reconst_lambda,
-                "KLD": KLD / self.kld_lambda,
-                "clf": pred_loss / self.clf_lambda }
+        return {"RECONST": RECONST * self.reconst_lambda,
+                "KLD": KLD * self.kld_lambda,
+                "clf": pred_loss * self.clf_lambda }
 
     def training_step(self, batch):
         x, y = batch
-        if random.random() > self.p_using_true_label:
-            y = self.get_random_labels(y.shape)
+        y_new = []
+        for label in y:
+            if random.random() < self.p_using_true_label:
+                y_new.append(label)
+            else:
+                y_new.append(random.randint(0, self.n_classes - 1))
+            # y = self.get_random_labels(y.shape)
+        y = torch.tensor(y_new).to(torch.long).to(self.device)
         recon_batch, pred_prob, mu, log_var = self(x, y)
         loss = self.loss_function(
             recon_batch.view(-1, self.x_dim ** 2),
